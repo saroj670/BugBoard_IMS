@@ -1,0 +1,19 @@
+
+[theme]
+base = "dark"
+
+# BugBoard dark navy background
+primaryColor = "#27C9B9"
+backgroundColor = "#0B141B"
+secondaryBackgroundColor = "#14232D"
+
+# Text
+textColor = "#E6EEF2"
+
+# Typography
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#08131B"
+secondaryBackgroundColor = "#14232D"
+textColor = "#E6EEF2"
