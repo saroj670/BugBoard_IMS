@@ -1,0 +1,10 @@
+# IMS AI Quality Board guardrails (KEY=VALUE)
+# Edit values, save as UTF-8 .txt, and upload in Test Case Generator.
+# These rules are checked in Python after generation.
+MIN_STEPS=2
+REQUIRE_PRECONDITIONS=false
+REQUIRE_UNIQUE_TITLES=true
+REQUIRE_SEQUENTIAL_IDS=true
+ALLOWED_CATEGORIES=positive,negative,boundary,other
+# Required fields and non-empty step actions/results are always enforced.
+# This file cannot override the built-in security and structural checks.
