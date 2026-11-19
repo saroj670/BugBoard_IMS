@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 DEFAULT_GUARDRAILS_PATH = Path(__file__).resolve().parent.parent / 'guardrails' / 'default_guardrails.txt'
 DEFAULT_GUARDRAILS = '''MIN_STEPS=2
-REQUIRE_PRECONDITIONS=true
+REQUIRE_PRECONDITIONS=false
 REQUIRE_UNIQUE_TITLES=true
 REQUIRE_SEQUENTIAL_IDS=true
 ALLOWED_CATEGORIES=positive,negative,boundary,other
