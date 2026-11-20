@@ -2,6 +2,8 @@ import csv
 import io
 import re
 import streamlit as st
+import pandas as pd
+from jira_sync import sync_project, load_snapshot
 from dotenv import load_dotenv
 from services.generator import generate_testcases, load_default_guardrails, parse_guardrails, suite_to_csv
 
@@ -14,6 +16,7 @@ for key, default in {
     'messages': [], 'suite': None, 'validation': None, 'requirement': DEFAULT_REQUIREMENT,
     'guardrails_text': load_default_guardrails(), 'guardrails_source': 'Default file',
     'defects': [], 'changes': [], 'executions': [], 'jira_sync': [],
+    'live_snapshot': None, 'jira_error': None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -89,9 +92,20 @@ PAGES = ['Dashboard', 'Test Case Generator', 'Historical RCA (coming soon)',
 with st.sidebar:
     st.header('Navigation')
     page = st.selectbox('Select service', PAGES)
-    st.caption('Jira: not connected · CSV fallback available · No Jira writes')
+    st.caption('Jira REST: DJ project · read-only · CSV fallback available')
+    project_key = st.text_input('Jira project key', value='DJ').strip().upper()
+    if st.button('🔄 Sync Jira now', type='primary', use_container_width=True):
+        with st.spinner(f'Reading Jira project {project_key}...'):
+            try:
+                st.session_state.live_snapshot = sync_project(project_key)
+                st.session_state.jira_error = None
+            except Exception as exc:
+                st.session_state.jira_error = str(exc)
+    if st.session_state.jira_error:
+        st.error('Jira sync failed: ' + st.session_state.jira_error)
+    st.caption('Jira credentials are loaded from .env locally or Streamlit secrets in the cloud.')
     with st.expander('Data Sources · CSV Uploads', expanded=False):
-        st.caption('Upload exports from Jira/Xray or other systems. Imports are session-only; no live Jira sync is performed.')
+        st.caption('Optional CSV fallback; Jira sync uses the live REST API.')
         for key, (id_label, required, template) in DATASETS.items():
             st.download_button(f'Download {key} CSV template', template, f'{key}_template.csv',
                                mime='text/csv', key=f'template_{key}')
@@ -112,7 +126,7 @@ header_left, header_center = st.columns([3, 2], vertical_alignment='center')
 with header_left:
     with st.container(key='brand_header'):
         st.markdown('#### 🐞 AI Quality Board')
-        st.caption('Phase 1 POC · Local drafts · No Jira writes')
+        st.caption('Live Jira read-only dashboard · AI-generated drafts stay local')
 with header_center:
     with st.container(key='page_header'):
         st.markdown(f"<h3 style='text-align:center'>{page}</h3>", unsafe_allow_html=True)
@@ -206,61 +220,72 @@ main, chat = st.columns([4, 1.35], gap='medium', vertical_alignment='top')
 
 with main:
     if page == 'Dashboard':
-        total = len(st.session_state.suite.test_cases) if st.session_state.suite else 0
-        synced = sum(1 for row in st.session_state.jira_sync if row.get('sync_status', '').lower() == 'synced')
-        with st.container(key='dashboard_summary'):
-            st.markdown('##### Quality Overview')
-            first = st.columns(2, gap='small')
-            first[0].metric('Generated test cases', total)
-            first[1].metric('Jira synced cases (import)', synced if st.session_state.jira_sync else '—')
-            second = st.columns(2, gap='small')
-            second[0].metric('Total defects (import)', metric_count('defects'))
-            second[1].metric('Total CRs (import)', metric_count('changes'))
-        st.caption('— means no snapshot uploaded. Imported counts are not live Jira data; generated cases are session drafts.')
-        st.divider()
-        a, b = st.columns(2)
-        with a:
-            with st.container(key='dashboard_defects'):
-                st.markdown('#### Defect status')
-                counts = status_counts(st.session_state.defects)
-                if counts:
-                    for status, count in sorted(counts.items()):
-                        st.metric(status.title(), count)
+        snapshot = st.session_state.live_snapshot or load_snapshot(project_key)
+        if snapshot:
+            st.caption(f"Jira source: {snapshot['source']} | Project: {snapshot['project_name']} ({snapshot['project']}) | Last sync: {snapshot['synced_at']}")
+            records = snapshot.get('records', [])
+            fdrs = sorted({r['FDR'] for r in records if r.get('FDR') not in ('', 'Unassigned')})
+            selected_fdr = st.selectbox('Filter by FDR', ['All FDRs'] + fdrs, key='dashboard_fdr_filter')
+            visible = [r for r in records if selected_fdr == 'All FDRs' or r.get('FDR') == selected_fdr]
+            def count_kind(kind):
+                return sum(r.get('Record Type') == kind for r in visible)
+            with st.container(key='dashboard_summary'):
+                st.markdown('##### Live Jira Quality Overview')
+                metrics = [
+                    ('FDRs', len({r['FDR'] for r in visible if r.get('FDR') not in ('', 'Unassigned')})),
+                    ('Test Cases', count_kind('Test Case')),
+                    ('Test Sets', count_kind('Test Set')),
+                    ('Test Plans', count_kind('Test Plan')),
+                    ('Executions', count_kind('Test Execution')),
+                    ('Defects', count_kind('Defect')),
+                    ('Total Issues', len(visible)),
+                ]
+                columns = st.columns(4)
+                for index, (label, value) in enumerate(metrics):
+                    columns[index % 4].metric(label, value)
+            left, right = st.columns(2)
+            with left:
+                with st.container(key='dashboard_defects'):
+                    st.markdown('#### Issue type distribution')
+                    if visible:
+                        st.bar_chart(pd.Series([r['Record Type'] for r in visible]).value_counts())
+                    else:
+                        st.info('No issues match this FDR.')
+            with right:
+                with st.container(key='dashboard_crs'):
+                    st.markdown('#### Jira workflow status')
+                    if visible:
+                        st.bar_chart(pd.Series([r['Status'] for r in visible]).value_counts())
+                    else:
+                        st.info('No issues match this FDR.')
+            with st.container(key='dashboard_fdr'):
+                st.markdown('#### Execution summary by FDR')
+                executions = [r for r in visible if r['Record Type'] == 'Test Execution']
+                if executions:
+                    st.dataframe(pd.DataFrame([{'FDR': r['FDR'], 'Issue': r['Key'],
+                                               'Summary': r['Summary'], 'Jira Status': r['Status'],
+                                               'Link': r['URL']} for r in executions]),
+                                 column_config={'Link': st.column_config.LinkColumn('Open Jira')},
+                                 hide_index=True, use_container_width=True)
+                    st.caption('Jira workflow status is not the same as Xray step-level PASS/FAIL.')
                 else:
-                    st.caption('No defect data connected')
-        with b:
-            with st.container(key='dashboard_crs'):
-                st.markdown('#### CR status')
-                counts = status_counts(st.session_state.changes)
-                if counts:
-                    for status, count in sorted(counts.items()):
-                        st.metric(status.title(), count)
+                    st.info('No test executions in the selected FDR.')
+            with st.container(key='dashboard_latest'):
+                st.markdown('#### Jira issues')
+                if visible:
+                    table = pd.DataFrame(visible)
+                    st.dataframe(table[['Key', 'Record Type', 'FDR', 'Summary', 'Status', 'Priority', 'URL']],
+                                 column_config={'URL': st.column_config.LinkColumn('Open Jira')},
+                                 hide_index=True, use_container_width=True)
+                    st.download_button('Download Jira snapshot CSV', table.to_csv(index=False).encode('utf-8-sig'),
+                                       file_name=f"bugboard_{snapshot['project'].lower()}_snapshot.csv", mime='text/csv')
                 else:
-                    st.caption('No change request data connected')
-        with st.container(key='dashboard_fdr'):
-            st.markdown('#### Execution summary by FDR')
-            if st.session_state.executions:
-                fdrs = sorted({r['fdr'] for r in st.session_state.executions})
-                chosen = st.selectbox('Filter FDR', ['All FDRs'] + fdrs)
-                rows = [r for r in st.session_state.executions if chosen == 'All FDRs' or r['fdr'] == chosen]
-                grouped = {}
-                for r in rows:
-                    fdr = r['fdr']
-                    status = r['status'].strip().upper().replace(' ', '_')
-                    if fdr not in grouped:
-                        grouped[fdr] = {'FDR': fdr, 'Total': 0, 'PASS': 0,
-                                        'FAIL': 0, 'BLOCKED': 0, 'NOT RUN': 0}
-                    grouped[fdr]['Total'] += 1
-                    field = 'NOT RUN' if status in ('NOT_RUN', 'NOTRUN') else status
-                    if field in ('PASS', 'FAIL', 'BLOCKED', 'NOT RUN'):
-                        grouped[fdr][field] += 1
-                st.dataframe(list(grouped.values()), hide_index=True, use_container_width=True)
-            else:
-                st.caption('No FDR execution data connected')
-        with st.container(key='dashboard_latest'):
-            st.markdown('#### Latest generated test cases')
+                    st.info('No Jira issues returned for this selection.')
+        else:
+            st.info('Click **Sync Jira now** in the sidebar to load live DJ records. No demo counts are invented.')
+        with st.expander('Locally generated test cases (not yet saved to Jira)'):
             if st.session_state.suite is None:
-                st.caption('No test cases generated yet')
+                st.caption('Use Test Case Generator to create local drafts.')
             else:
                 show_suite()
     elif page == 'Test Case Generator':
@@ -330,7 +355,7 @@ with main:
 with chat:
     with st.container(key='assistant_card'):
       with st.expander('🤖 AI Assistant', expanded=False):
-          st.caption('Answers based on current session data; no live Jira access')
+          st.caption('Answers from current session and last synced Jira snapshot; no Jira writes')
           history = st.container(height=260, border=False)
           with history:
               for message in st.session_state.messages:
@@ -369,7 +394,7 @@ with chat:
                            '\n'.join(f'- {k}: {v}' for k, v in counts.items())) if counts else 'No execution snapshot uploaded.'
               elif re.search(r'\b(jira|sync)\b', lower):
                   synced = sum(1 for r in st.session_state.jira_sync if r.get('sync_status', '').lower() == 'synced')
-                  reply = f'**Imported Jira sync records marked Synced:** {synced}. Live Jira connection: **Not connected**.'
+                  reply = (f"**Live Jira:** {len(st.session_state.live_snapshot['records'])} issues in {st.session_state.live_snapshot['project']}." if st.session_state.live_snapshot else 'No Jira sync in this session yet. Click Sync Jira now.')
               elif re.search(r'\b(guardrail|validation|finding)\b', lower):
                   reply = (f'Guardrail source: **{st.session_state.guardrails_source}**. '
                            f'Status: **{check["status"] if check else "Not run"}**. '
@@ -382,7 +407,7 @@ with chat:
                   reply = (f'**Dashboard:** {total} generated cases; {len(st.session_state.defects)} imported defects; '
                            f'{len(st.session_state.changes)} imported CRs; '
                            f'{len(st.session_state.executions)} imported executions. '
-                           'Live Jira connection: not connected.')
+                           'Jira records are shown on the Dashboard after sync.')
               else:
                   reply = 'I can summarize generated test cases, imported defects, CRs, FDR executions, guardrails and Jira sync snapshots.'
               st.session_state.messages.append({'role': 'assistant', 'content': reply})

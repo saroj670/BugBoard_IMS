@@ -1,0 +1,1 @@
+JIRA_MCP_URL = "https://mcp.atlassian.com/v2/mcp"
