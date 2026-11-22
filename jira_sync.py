@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.jira_agent import JiraAgent
+from sqlite_store import save_snapshot, latest_snapshot
 
 SNAPSHOT = Path(__file__).resolve().parent / 'jira_snapshot.json'
 
@@ -63,10 +64,14 @@ def sync_project(project='DJ'):
     temp = SNAPSHOT.with_suffix('.tmp')
     temp.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding='utf-8')
     temp.replace(SNAPSHOT)
+    save_snapshot(snapshot)
     return snapshot
 
 
 def load_snapshot(project='DJ'):
+    stored = latest_snapshot(project)
+    if stored is not None:
+        return stored
     if not SNAPSHOT.exists():
         return None
     try:

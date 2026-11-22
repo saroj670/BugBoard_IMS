@@ -4,6 +4,7 @@ import re
 import streamlit as st
 import pandas as pd
 from jira_sync import sync_project, load_snapshot
+from sqlite_store import latest_snapshot, history as db_history, init_db
 from dotenv import load_dotenv
 from services.generator import generate_testcases, load_default_guardrails, parse_guardrails, suite_to_csv
 
@@ -87,7 +88,7 @@ def run_generation(requirement, count):
     return suite, validation
 
 
-PAGES = ['Dashboard', 'Test Case Generator', 'Historical RCA (coming soon)',
+PAGES = ['Dashboard', 'Test Case Generator', 'Historical RCA',
          'Defect & CR Board', 'Execution by FDR']
 with st.sidebar:
     st.header('Navigation')
@@ -216,17 +217,30 @@ div[data-testid="stVerticalBlock"] { gap: .8rem; }
 }
 </style>
 """, unsafe_allow_html=True)
-main, chat = st.columns([4, 1.35], gap='medium', vertical_alignment='top')
+# Initialize SQLite once per rerun; keep local generator and CSV functionality intact.
+try:
+    init_db()
+    db_error = None
+except Exception as exc:
+    db_error = str(exc)
 
+snapshot = None
+if not db_error:
+    snapshot = latest_snapshot(project_key)
+if snapshot is None:
+    snapshot = st.session_state.live_snapshot or load_snapshot(project_key)
+all_jira_records = snapshot.get('records', []) if snapshot else []
+available_fdrs = sorted({r.get('FDR') for r in all_jira_records if r.get('FDR') not in ('', None, 'Unassigned')})
+
+main, chat = st.columns([4, 1.35], gap='medium', vertical_alignment='top')
 with main:
+    if db_error:
+        st.warning(f'SQLite unavailable: {db_error}. Showing available Jira snapshot instead.')
     if page == 'Dashboard':
-        snapshot = st.session_state.live_snapshot or load_snapshot(project_key)
         if snapshot:
             st.caption(f"Jira source: {snapshot['source']} | Project: {snapshot['project_name']} ({snapshot['project']}) | Last sync: {snapshot['synced_at']}")
-            records = snapshot.get('records', [])
-            fdrs = sorted({r['FDR'] for r in records if r.get('FDR') not in ('', 'Unassigned')})
-            selected_fdr = st.selectbox('Filter by FDR', ['All FDRs'] + fdrs, key='dashboard_fdr_filter')
-            visible = [r for r in records if selected_fdr == 'All FDRs' or r.get('FDR') == selected_fdr]
+            selected_fdr = st.selectbox('Filter by FDR', ['All FDRs'] + available_fdrs, key='dashboard_fdr_filter')
+            visible = [r for r in all_jira_records if selected_fdr == 'All FDRs' or r.get('FDR') == selected_fdr]
             def count_kind(kind):
                 return sum(r.get('Record Type') == kind for r in visible)
             with st.container(key='dashboard_summary'):
@@ -243,46 +257,9 @@ with main:
                 columns = st.columns(4)
                 for index, (label, value) in enumerate(metrics):
                     columns[index % 4].metric(label, value)
-            left, right = st.columns(2)
-            with left:
-                with st.container(key='dashboard_defects'):
-                    st.markdown('#### Issue type distribution')
-                    if visible:
-                        st.bar_chart(pd.Series([r['Record Type'] for r in visible]).value_counts())
-                    else:
-                        st.info('No issues match this FDR.')
-            with right:
-                with st.container(key='dashboard_crs'):
-                    st.markdown('#### Jira workflow status')
-                    if visible:
-                        st.bar_chart(pd.Series([r['Status'] for r in visible]).value_counts())
-                    else:
-                        st.info('No issues match this FDR.')
-            with st.container(key='dashboard_fdr'):
-                st.markdown('#### Execution summary by FDR')
-                executions = [r for r in visible if r['Record Type'] == 'Test Execution']
-                if executions:
-                    st.dataframe(pd.DataFrame([{'FDR': r['FDR'], 'Issue': r['Key'],
-                                               'Summary': r['Summary'], 'Jira Status': r['Status'],
-                                               'Link': r['URL']} for r in executions]),
-                                 column_config={'Link': st.column_config.LinkColumn('Open Jira')},
-                                 hide_index=True, use_container_width=True)
-                    st.caption('Jira workflow status is not the same as Xray step-level PASS/FAIL.')
-                else:
-                    st.info('No test executions in the selected FDR.')
-            with st.container(key='dashboard_latest'):
-                st.markdown('#### Jira issues')
-                if visible:
-                    table = pd.DataFrame(visible)
-                    st.dataframe(table[['Key', 'Record Type', 'FDR', 'Summary', 'Status', 'Priority', 'URL']],
-                                 column_config={'URL': st.column_config.LinkColumn('Open Jira')},
-                                 hide_index=True, use_container_width=True)
-                    st.download_button('Download Jira snapshot CSV', table.to_csv(index=False).encode('utf-8-sig'),
-                                       file_name=f"bugboard_{snapshot['project'].lower()}_snapshot.csv", mime='text/csv')
-                else:
-                    st.info('No Jira issues returned for this selection.')
+            st.caption('Dashboard shows numbers only. See Execution by FDR for charts and Jira issue details.')
         else:
-            st.info('Click **Sync Jira now** in the sidebar to load live DJ records. No demo counts are invented.')
+            st.info('Click **Sync Jira now** in the sidebar to load Jira records into SQLite. No demo counts are invented.')
         with st.expander('Locally generated test cases (not yet saved to Jira)'):
             if st.session_state.suite is None:
                 st.caption('Use Test Case Generator to create local drafts.')
@@ -340,17 +317,63 @@ with main:
     elif page == 'Execution by FDR':
         with st.container(key='execution_board'):
             st.markdown('#### Execution by FDR')
-            if st.session_state.executions:
-                fdrs = sorted({r['fdr'] for r in st.session_state.executions})
-                chosen = st.selectbox('FDR', fdrs)
+            if snapshot:
+                default_fdr = st.session_state.get('dashboard_fdr_filter', 'All FDRs')
+                choices = ['All FDRs'] + available_fdrs
+                chosen = st.selectbox('FDR', choices, index=choices.index(default_fdr) if default_fdr in choices else 0, key='execution_fdr_filter')
+                visible = [r for r in all_jira_records if chosen == 'All FDRs' or r.get('FDR') == chosen]
+                executions = [r for r in visible if r.get('Record Type') == 'Test Execution']
+                st.metric('Test Executions', len(executions))
+                left, right = st.columns(2)
+                with left:
+                    st.markdown('##### Issue type distribution')
+                    if visible:
+                        st.bar_chart(pd.Series([r.get('Record Type', 'Other') for r in visible]).value_counts())
+                    else:
+                        st.info('No matching issues.')
+                with right:
+                    st.markdown('##### Jira workflow status')
+                    if visible:
+                        st.bar_chart(pd.Series([r.get('Status', 'Unknown') for r in visible]).value_counts())
+                    else:
+                        st.info('No matching issues.')
+                st.markdown('##### Execution records')
+                if executions:
+                    st.dataframe(pd.DataFrame([{'FDR': r['FDR'], 'Issue': r['Key'],
+                                                'Summary': r['Summary'], 'Jira Status': r['Status'],
+                                                'Link': r['URL']} for r in executions]),
+                                 column_config={'Link': st.column_config.LinkColumn('Open Jira')},
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.info('No test execution issues for this FDR.')
+                st.caption('Jira workflow status is not Xray step-level PASS/FAIL. No execution result is inferred.')
+                st.markdown('##### All Jira issues for selected FDR')
+                if visible:
+                    table = pd.DataFrame(visible)
+                    st.dataframe(table[['Key', 'Record Type', 'FDR', 'Summary', 'Status', 'Priority', 'URL']],
+                                 column_config={'URL': st.column_config.LinkColumn('Open Jira')},
+                                 hide_index=True, use_container_width=True)
+                    st.download_button('Download Jira issues CSV', table.to_csv(index=False).encode('utf-8-sig'),
+                                       file_name=f'{project_key.lower()}_fdr_issues.csv', mime='text/csv')
+            elif st.session_state.executions:
+                fdr_values = sorted({r['fdr'] for r in st.session_state.executions})
+                chosen = st.selectbox('FDR', fdr_values)
                 st.dataframe([r for r in st.session_state.executions if r['fdr'] == chosen],
                              hide_index=True, use_container_width=True)
             else:
-                st.caption('No execution data connected. Upload CSV in the sidebar.')
+                st.caption('No Jira execution data yet. Sync Jira in the sidebar or upload execution CSV.')
     else:
         with st.container(key='rca_board'):
             st.markdown('#### Historical RCA')
-            st.caption('Historical RCA integration is planned for a later phase.')
+            st.caption('Phase 3: similar-defect search and evidence-based RCA are planned. SQLite history is available below.')
+            if snapshot and not db_error:
+                history_rows = db_history(project_key)
+                if history_rows:
+                    st.dataframe(pd.DataFrame(history_rows), hide_index=True, use_container_width=True)
+                else:
+                    st.info('No saved sync history yet.')
+            else:
+                st.info('Sync Jira to begin collecting local history.')
 
 with chat:
     with st.container(key='assistant_card'):
@@ -368,47 +391,105 @@ with chat:
               suite = st.session_state.suite
               check = st.session_state.validation
               total = len(suite.test_cases) if suite else 0
+              match_fdr = re.search(r'\bFDR-[A-Z0-9-]+\b', prompt, re.I)
+              selected_context = (st.session_state.get('execution_fdr_filter', 'All FDRs') if page == 'Execution by FDR' else st.session_state.get('dashboard_fdr_filter', 'All FDRs'))
+              context = match_fdr.group(0).upper() if match_fdr else selected_context
+              if context not in available_fdrs and context != 'All FDRs':
+                  context_valid = False
+              else:
+                  context_valid = True
+              relevant = [r for r in all_jira_records if context == 'All FDRs' or r.get('FDR') == context]
+              def jira_count(kind):
+                  return sum(r.get('Record Type') == kind for r in relevant)
               if re.search(r'\b(generat\w*|creat\w*|draft\w*)\b', lower) and re.search(r'\btest\s*cases?\b|\btestcases?\b', lower):
-                  match = re.search(r'\b(\d{1,2})\s+test\s*cases?\b', lower)
-                  count = min(15, max(1, int(match.group(1)))) if match else 5
-                  requirement = re.sub(r'^.*?\btest\s*cases?\b\s*(?:for|from|based on|covering)?\s*',
-                                       '', prompt, count=1, flags=re.I).strip(' :.-')
+                  count_match = re.search(r'\b(\d{1,2})\s+test\s*cases?\b', lower)
+                  count = min(15, max(1, int(count_match.group(1)))) if count_match else 5
+                  requirement = re.sub(r'^.*?\btest\s*cases?\b\s*(?:for|from|based on|covering)?\s*', '', prompt, count=1, flags=re.I).strip(' :.-')
                   if len(requirement) < 20:
                       requirement = st.session_state.requirement
                   try:
-                      suite, check = run_generation(requirement, count)
-                      reply = f'Generated **{len(suite.test_cases)}** draft test cases. Guardrail: **{check["status"]}**. Human review required.'
+                      generated_suite, validation = run_generation(requirement, count)
+                      reply = f'Generated **{len(generated_suite.test_cases)}** draft test cases. Guardrail: **{validation["status"]}**. Human review required.'
                   except Exception as exc:
                       reply = f'Generation failed: {exc}'
-              elif re.search(r'\b(defects?|bugs?)\b', lower):
-                  counts = status_counts(st.session_state.defects)
-                  reply = ('**Defects:** ' + str(len(st.session_state.defects)) + '\n\n' +
-                           '\n'.join(f'- {k}: {v}' for k, v in counts.items())) if counts else 'No defect snapshot uploaded.'
-              elif re.search(r'\b(crs?|change requests?)\b', lower):
-                  counts = status_counts(st.session_state.changes)
-                  reply = ('**CRs:** ' + str(len(st.session_state.changes)) + '\n\n' +
-                           '\n'.join(f'- {k}: {v}' for k, v in counts.items())) if counts else 'No CR snapshot uploaded.'
-              elif re.search(r'\b(executions?|fdr|pass|fail)\b', lower):
-                  counts = status_counts(st.session_state.executions)
-                  reply = ('**Execution records:** ' + str(len(st.session_state.executions)) + '\n\n' +
-                           '\n'.join(f'- {k}: {v}' for k, v in counts.items())) if counts else 'No execution snapshot uploaded.'
-              elif re.search(r'\b(jira|sync)\b', lower):
-                  synced = sum(1 for r in st.session_state.jira_sync if r.get('sync_status', '').lower() == 'synced')
-                  reply = (f"**Live Jira:** {len(st.session_state.live_snapshot['records'])} issues in {st.session_state.live_snapshot['project']}." if st.session_state.live_snapshot else 'No Jira sync in this session yet. Click Sync Jira now.')
               elif re.search(r'\b(guardrail|validation|finding)\b', lower):
                   reply = (f'Guardrail source: **{st.session_state.guardrails_source}**. '
                            f'Status: **{check["status"] if check else "Not run"}**. '
                            + ('\n'.join(check.get('findings', [])) if check else ''))
               elif re.search(r'\b(requirement)\b', lower):
                   reply = st.session_state.requirement
-              elif re.search(r'\b(cases?|testcases?|test cases?)\b', lower):
+              elif re.search(r'\b(local|generated|draft)\b', lower) and re.search(r'\b(test\s*cases?|testcases?)\b', lower):
                   reply = f'**{total}** draft test cases generated in this session.'
-              elif re.search(r'\b(dashboard|summary|overview|status)\b', lower):
-                  reply = (f'**Dashboard:** {total} generated cases; {len(st.session_state.defects)} imported defects; '
-                           f'{len(st.session_state.changes)} imported CRs; '
-                           f'{len(st.session_state.executions)} imported executions. '
-                           'Jira records are shown on the Dashboard after sync.')
+              elif re.search(r'\b(crs?|change requests?)\b', lower):
+                  counts = status_counts(st.session_state.changes)
+                  reply = ('**Imported CRs:** ' + str(len(st.session_state.changes)) + '\n\n' +
+                           '\n'.join(f'- {k}: {v}' for k, v in counts.items())) if counts else 'No change-request CSV uploaded; Jira CR classification is not synchronized.'
+              elif not snapshot:
+                  reply = 'No Jira data synchronized yet. Click **Sync Jira now** in the sidebar.'
+              elif not context_valid:
+                  reply = f'No synchronized Jira records found for **{context}**. Last sync: {snapshot["synced_at"]}.'
+              elif re.search(r'\b(status|state|progress|workflow)\b', lower) and re.search(r'\b(test\s*cases?|testcases?|fdr|dj-\d+)\b', lower):
+                  # Report Jira workflow states only; never interpret them as Xray PASS/FAIL.
+                  issue_key_match = re.search(r'\b[A-Z][A-Z0-9_]+-\d+\b', prompt, re.I)
+                  if issue_key_match:
+                      issue_key = issue_key_match.group(0).upper()
+                      candidates = [r for r in all_jira_records if r.get('Key', '').upper() == issue_key]
+                      if candidates:
+                          item = candidates[0]
+                          reply = (f'**{item["Key"]} — Jira issue status**\n\n'
+                                   f'- Summary: {item.get("Summary", "")}\n'
+                                   f'- Issue type: {item.get("Record Type", "Other")}\n'
+                                   f'- FDR: {item.get("FDR", "Unassigned")}\n'
+                                   f'- Workflow status: **{item.get("Status", "Unknown")}**\n'
+                                   f'- [Open in Jira]({item.get("URL", "")})\n\n'
+                                   'This is the Jira workflow status, not an Xray test execution PASS/FAIL result.')
+                      else:
+                          reply = f'Issue **{issue_key}** was not found in the latest synchronized Jira snapshot.'
+                  else:
+                      cases = [r for r in relevant if r.get('Record Type') == 'Test Case']
+                      execution_issues = [r for r in relevant if r.get('Record Type') == 'Test Execution']
+                      distribution = status_counts([{'status': r.get('Status', 'Unknown')} for r in cases])
+                      lines = [f'**Test case workflow status — {context}**',
+                               f'Last synced: {snapshot["synced_at"]}', '',
+                               f'**Test cases: {len(cases)}**', '']
+                      if cases:
+                          lines += ['| Jira key | Test case | Workflow status |', '|---|---|---|']
+                          for r in cases[:30]:
+                              safe_summary = str(r.get('Summary', '')).replace('|', '/').replace('\n', ' ')
+                              lines.append(f'| [{r["Key"]}]({r["URL"]}) | {safe_summary} | **{r.get("Status", "Unknown")}** |')
+                          if len(cases) > 30:
+                              lines.append(f'\nShowing 30 of {len(cases)} cases.')
+                          lines += ['', '**Workflow totals:** ' + ', '.join(f'{status}: {count}' for status, count in sorted(distribution.items()))]
+                      else:
+                          lines.append('No test case issues found for this FDR.')
+                      lines += ['', f'**Test execution issues:** {len(execution_issues)}',
+                                '**Actual PASS/FAIL:** Not available from the current Jira REST snapshot.',
+                                'Jira Backlog/In Progress/Done is not a test execution result.']
+                      reply = '\n'.join(lines)
+              elif re.search(r'\b(rca|root cause|similar defects?|history|historical)\b', lower):
+                  reply = 'Historical RCA analysis is planned for Phase 3. Current Jira records alone do not establish verified root causes.'
+              elif re.search(r'\b(pass|fail|passed|failed|xray|step.level)\b', lower):
+                  reply = ('The current Jira sync does not retrieve Xray step-level PASS/FAIL. '
+                           'Jira issue workflow status is not an execution result. '
+                           f'Found **{jira_count("Test Execution")}** execution issues for **{context}**.')
+              elif re.search(r'\b(list|show|which|details?)\b', lower) and re.search(r'\b(defects?|bugs?|executions?|test\s*cases?|test\s*plans?|test\s*sets?)\b', lower):
+                  kind = ('Defect' if re.search(r'\b(defects?|bugs?)\b', lower) else
+                          'Test Execution' if re.search(r'\bexecutions?\b', lower) else
+                          'Test Plan' if re.search(r'\btest\s*plans?\b', lower) else
+                          'Test Set' if re.search(r'\btest\s*sets?\b', lower) else 'Test Case')
+                  matches = [r for r in relevant if r.get('Record Type') == kind]
+                  reply = (f'**{kind} issues for {context}: {len(matches)}**\n\n' +
+                           '\n'.join(f'- [{r["Key"]}]({r["URL"]}): {r["Summary"]} ({r["Status"]})' for r in matches[:20])) if matches else f'No {kind.lower()} issues found for {context}.'
+                  if len(matches) > 20:
+                      reply += f'\n\nShowing 20 of {len(matches)}. See Execution by FDR for the full table.'
               else:
-                  reply = 'I can summarize generated test cases, imported defects, CRs, FDR executions, guardrails and Jira sync snapshots.'
+                  reply = (f'**Jira {context}** · last synced {snapshot["synced_at"]}\n\n'
+                           f'- Test Cases: **{jira_count("Test Case")}**\n'
+                           f'- Test Sets: **{jira_count("Test Set")}**\n'
+                           f'- Test Plans: **{jira_count("Test Plan")}**\n'
+                           f'- Executions: **{jira_count("Test Execution")}**\n'
+                           f'- Defects: **{jira_count("Defect")}**\n'
+                           f'- Total Issues: **{len(relevant)}**\n\n'
+                           'Counts come from synchronized Jira records; no results are invented.')
               st.session_state.messages.append({'role': 'assistant', 'content': reply})
               st.rerun()
